@@ -30,3 +30,5 @@ pub mod config;
 pub mod runloop;
 /// The signer module for processing events
 pub mod signer;
+/// The state module for the signer
+pub mod signerdb;

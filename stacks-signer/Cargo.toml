@@ -28,6 +28,8 @@ libsigner = { path = "../libsigner" }
 libstackerdb = { path = "../libstackerdb" }
 rand_core = "0.6"
 reqwest = { version = "0.11.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+r2d2 = "0.8.9"
+r2d2_sqlite = "0.17.0"
 serde = "1"
 serde_derive = "1"
 serde_stacker = "0.1"
@@ -46,6 +48,10 @@ rand = { workspace = true }
 [dev-dependencies]
 serial_test = "3.0.0"
 clarity = { path = "../clarity", features = ["testing"] }
+
+[dependencies.rusqlite]
+version = "=0.24.2"
+features = ["blob", "serde_json", "i128_blob", "bundled", "trace"]
 
 [dependencies.serde_json]
 version = "1.0"

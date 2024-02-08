@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use blockstack_lib::chainstate::nakamoto::NakamotoBlock;
@@ -24,6 +25,7 @@ use blockstack_lib::util_lib::boot::boot_code_id;
 use clarity::vm::Value as ClarityValue;
 use hashbrown::{HashMap, HashSet};
 use libsigner::{BlockRejection, BlockResponse, RejectCode, SignerEvent, SignerMessage};
+use serde_derive::{Deserialize, Serialize};
 use slog::{slog_debug, slog_error, slog_info, slog_warn};
 use stacks_common::codec::{read_next, StacksMessageCodec};
 use stacks_common::types::chainstate::StacksAddress;
@@ -46,13 +48,15 @@ use crate::client::{
     retry_with_exponential_backoff, ClientError, StackerDB, StacksClient, VOTE_FUNCTION_NAME,
 };
 use crate::config::{GlobalConfig, RewardCycleConfig};
+use crate::signerdb::SignerDb;
 
 /// Additional Info about a proposed block
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct BlockInfo {
     /// The block we are considering
-    block: NakamotoBlock,
+    pub block: NakamotoBlock,
     /// Our vote on the block if we have one yet
-    vote: Option<Vec<u8>>,
+    pub vote: Option<Vec<u8>>,
     /// Whether the block contents are valid
     valid: Option<bool>,
     /// The associated packet nonce request if we have one
@@ -82,6 +86,11 @@ impl BlockInfo {
             nonce_request: Some(nonce_request),
             signed_over: true,
         }
+    }
+
+    /// Return the block's signer signature hash
+    pub fn signer_signature_hash(&self) -> Sha512Trunc256Sum {
+        self.block.header.signer_signature_hash()
     }
 }
 
@@ -122,7 +131,7 @@ pub struct Signer {
     pub state: State,
     /// Observed blocks that we have seen so far
     // TODO: cleanup storage and garbage collect this stuff
-    pub blocks: HashMap<Sha512Trunc256Sum, BlockInfo>,
+    // pub blocks: HashMap<Sha512Trunc256Sum, BlockInfo>,
     /// Received Commands that need to be processed
     pub commands: VecDeque<Command>,
     /// The stackerdb client
@@ -137,6 +146,10 @@ pub struct Signer {
     pub reward_cycle: u64,
     /// The tx fee in uSTX to use if the epoch is pre Nakamoto (Epoch 3.0)
     pub tx_fee_ms: u64,
+    /// Signer DB path
+    pub db_path: PathBuf,
+    /// SignerDB for state management
+    pub signer_db: SignerDb,
 }
 
 impl Signer {
@@ -188,11 +201,12 @@ impl Signer {
             config.ecdsa_private_key,
             reward_cycle_config.registered_signers.public_keys,
         );
+        let signer_db = SignerDb::new(&config.db_path).expect("Failed to connect to signer Db");
         Self {
             coordinator,
             signing_round,
             state: State::Idle,
-            blocks: HashMap::new(),
+            // blocks: HashMap::new(),
             commands: VecDeque::new(),
             stackerdb,
             is_mainnet: config.network.is_mainnet(),
@@ -200,6 +214,8 @@ impl Signer {
             signer_address_ids: reward_cycle_config.registered_signers.signer_address_ids,
             reward_cycle: reward_cycle_config.reward_cycle,
             tx_fee_ms: config.tx_fee_ms,
+            db_path: config.db_path.clone(),
+            signer_db,
         }
     }
 
@@ -243,10 +259,15 @@ impl Signer {
                 merkle_root,
             } => {
                 let signer_signature_hash = block.header.signer_signature_hash();
-                let block_info = self
-                    .blocks
-                    .entry(signer_signature_hash)
-                    .or_insert_with(|| BlockInfo::new(block.clone()));
+                // let block_info = self
+                //     .blocks
+                //     .entry(signer_signature_hash)
+                //     .or_insert_with(|| BlockInfo::new(block.clone()));
+                let mut block_info = self
+                    .signer_db
+                    .block_lookup(&signer_signature_hash)
+                    .unwrap_or_else(|_| Some(BlockInfo::new(block.clone())))
+                    .unwrap_or_else(|| BlockInfo::new(block.clone()));
                 if block_info.signed_over {
                     debug!("Signer #{}: Received a sign command for a block we are already signing over. Ignore it.", self.signer_id);
                     return;
@@ -322,34 +343,48 @@ impl Signer {
         block_validate_response: &BlockValidateResponse,
         res: Sender<Vec<OperationResult>>,
     ) {
-        let block_info = match block_validate_response {
+        let mut block_info = match block_validate_response {
             BlockValidateResponse::Ok(block_validate_ok) => {
                 let signer_signature_hash = block_validate_ok.signer_signature_hash;
                 // For mutability reasons, we need to take the block_info out of the map and add it back after processing
-                let Some(mut block_info) = self.blocks.remove(&signer_signature_hash) else {
-                    // We have not seen this block before. Why are we getting a response for it?
-                    debug!("Received a block validate response for a block we have not seen before. Ignoring...");
-                    return;
+                let mut block_info = match self.signer_db.block_lookup(&signer_signature_hash) {
+                    Ok(Some(block_info)) => block_info,
+                    Ok(None) => {
+                        // We have not seen this block before. Why are we getting a response for it?
+                        debug!("Received a block validate response for a block we have not seen before. Ignoring...");
+                        return;
+                    }
+                    Err(e) => {
+                        error!("Failed to lookup block in signer db: {:?}", e);
+                        return;
+                    }
                 };
                 let is_valid = self.verify_block_transactions(stacks_client, &block_info.block);
                 block_info.valid = Some(is_valid);
+                self.signer_db
+                    .insert_block(&block_info)
+                    .expect("Failed to insert block in DB");
                 info!(
                     "Signer #{}: Treating block validation for block {} as valid: {:?}",
                     self.signer_id,
                     &block_info.block.block_id(),
                     block_info.valid
                 );
-                // Add the block info back to the map
-                self.blocks
-                    .entry(signer_signature_hash)
-                    .or_insert(block_info)
+                block_info
             }
             BlockValidateResponse::Reject(block_validate_reject) => {
                 let signer_signature_hash = block_validate_reject.signer_signature_hash;
-                let Some(block_info) = self.blocks.get_mut(&signer_signature_hash) else {
-                    // We have not seen this block before. Why are we getting a response for it?
-                    debug!("Signer #{}: Received a block validate response for a block we have not seen before. Ignoring...", self.signer_id);
-                    return;
+                let mut block_info = match self.signer_db.block_lookup(&signer_signature_hash) {
+                    Ok(Some(block_info)) => block_info,
+                    Ok(None) => {
+                        // We have not seen this block before. Why are we getting a response for it?
+                        debug!("Received a block validate response for a block we have not seen before. Ignoring...");
+                        return;
+                    }
+                    Err(e) => {
+                        error!("Failed to lookup block in signer db: {:?}", e);
+                        return;
+                    }
                 };
                 block_info.valid = Some(false);
                 // Submit a rejection response to the .signers contract for miners
@@ -371,7 +406,7 @@ impl Signer {
         if let Some(mut nonce_request) = block_info.nonce_request.take() {
             debug!("Received a block validate response from the stacks node for a block we already received a nonce request for. Responding to the nonce request...");
             // We have received validation from the stacks node. Determine our vote and update the request message
-            Self::determine_vote(self.signer_id, block_info, &mut nonce_request);
+            Self::determine_vote(self.signer_id, &mut block_info, &mut nonce_request);
             // Send the nonce request through with our vote
             let packet = Packet {
                 msg: Message::NonceRequest(nonce_request),
@@ -406,6 +441,9 @@ impl Signer {
                 );
             }
         }
+        self.signer_db
+            .insert_block(&block_info)
+            .expect("Failed to insert block in DB");
     }
 
     /// Handle signer messages submitted to signers stackerdb
@@ -438,10 +476,11 @@ impl Signer {
     fn handle_proposed_blocks(&mut self, stacks_client: &StacksClient, blocks: &[NakamotoBlock]) {
         for block in blocks {
             // Store the block in our cache
-            self.blocks.insert(
-                block.header.signer_signature_hash(),
-                BlockInfo::new(block.clone()),
-            );
+            self.signer_db
+                .insert_block(&BlockInfo::new(block.clone()))
+                .unwrap_or_else(|e| {
+                    error!("Failed to insert block in DB: {e:?}");
+                });
             // Submit the block for validation
             stacks_client
                 .submit_block_for_validation(block.clone())
@@ -512,7 +551,12 @@ impl Signer {
             debug!("Signer #{}: Received a signature share request for an invalid block hash. Reject it.", self.signer_id);
             return false;
         };
-        match self.blocks.get(&hash).map(|block_info| &block_info.vote) {
+        match self
+            .signer_db
+            .block_lookup(&hash)
+            .expect("Failed to connect to signer DB")
+            .map(|b| b.vote)
+        {
             Some(Some(vote)) => {
                 // Overwrite with our agreed upon value in case another message won majority or the coordinator is trying to cheat...
                 debug!(
@@ -558,23 +602,28 @@ impl Signer {
             return false;
         };
         let signer_signature_hash = block.header.signer_signature_hash();
-        let Some(block_info) = self.blocks.get_mut(&signer_signature_hash) else {
-            // We have not seen this block before. Cache it. Send a RPC to the stacks node to validate it.
-            debug!("Signer #{}: We have received a block sign request for a block we have not seen before. Cache the nonce request and submit the block for validation...", self.signer_id);
-            // Store the block in our cache
-            self.blocks.insert(
-                signer_signature_hash,
-                BlockInfo::new_with_request(block.clone(), nonce_request.clone()),
-            );
-            stacks_client
-                .submit_block_for_validation(block)
-                .unwrap_or_else(|e| {
-                    warn!(
-                        "Signer #{}: Failed to submit block for validation: {e:?}",
-                        self.signer_id
-                    );
-                });
-            return false;
+        let mut block_info = match self
+            .signer_db
+            .block_lookup(&signer_signature_hash)
+            .expect("Failed to connect to signer DB")
+        {
+            Some(block_info) => block_info,
+            None => {
+                debug!("We have received a block sign request for a block we have not seen before. Cache the nonce request and submit the block for validation...");
+                let block_info = BlockInfo::new_with_request(block.clone(), nonce_request.clone());
+                self.signer_db
+                    .insert_block(&block_info)
+                    .expect("Failed to insert block in DB");
+                stacks_client
+                    .submit_block_for_validation(block)
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            "Signer #{}: Failed to submit block for validation: {e:?}",
+                            self.signer_id
+                        );
+                    });
+                return false;
+            }
         };
 
         if block_info.valid.is_none() {
@@ -584,7 +633,10 @@ impl Signer {
             return false;
         }
 
-        Self::determine_vote(self.signer_id, block_info, nonce_request);
+        Self::determine_vote(self.signer_id, &mut block_info, nonce_request);
+        self.signer_db
+            .insert_block(&block_info)
+            .expect("Failed to insert block in DB");
         true
     }
 
@@ -1011,7 +1063,9 @@ impl Signer {
         };
 
         // TODO: proper garbage collection...This is currently our only cleanup of blocks
-        self.blocks.remove(&signer_signature_hash);
+        self.signer_db
+            .remove_block(&signer_signature_hash)
+            .expect("Failed to remove block from to signer DB");
 
         // This signature is no longer valid. Do not broadcast it.
         if !signature.verify(aggregate_public_key, &message) {
@@ -1073,8 +1127,8 @@ impl Signer {
                             debug!("Signer #{}: Received a signature result for a signature over a non-block. Nothing to broadcast.", self.signer_id);
                             return;
                         };
-                        let Some(block_info) = self.blocks.remove(&signer_signature_hash) else {
-                            debug!("Signer #{}: Received a signature result for a block we have not seen before. Ignoring...", self.signer_id);
+                        let Some(block_info) = self.signer_db.block_lookup(&signer_signature_hash).expect("Failed to connect to signer DB") else {
+                            debug!("Received a signature result for a block we have not seen before. Ignoring...");
                             return;
                         };
                         block_info.block
@@ -1581,10 +1635,14 @@ mod tests {
         block.header.tx_merkle_root = tx_merkle_root;
 
         // Ensure this is a block the signer has seen already
-        signer.blocks.insert(
-            block.header.signer_signature_hash(),
-            BlockInfo::new(block.clone()),
-        );
+        signer
+            .signer_db
+            .insert_block(&BlockInfo::new(block.clone()))
+            .unwrap();
+
+        let signer_signature_hash = block.header.signer_signature_hash();
+
+        let signer_db = signer.signer_db.clone();
 
         let h = spawn(move || signer.verify_block_transactions(&stacks_client, &block));
 
@@ -1630,6 +1688,12 @@ mod tests {
 
         let valid = h.join().unwrap();
         assert!(valid);
+
+        let stored_block = signer_db
+            .block_lookup(&signer_signature_hash)
+            .expect("Failed to get block from db");
+        println!("{:?}", stored_block);
+        assert!(stored_block.is_some());
     }
 
     #[test]
