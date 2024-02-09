@@ -129,9 +129,6 @@ pub struct Signer {
     pub signing_round: WSTSSigner<v2::Signer>,
     /// the state of the signer
     pub state: State,
-    /// Observed blocks that we have seen so far
-    // TODO: cleanup storage and garbage collect this stuff
-    // pub blocks: HashMap<Sha512Trunc256Sum, BlockInfo>,
     /// Received Commands that need to be processed
     pub commands: VecDeque<Command>,
     /// The stackerdb client
@@ -147,7 +144,7 @@ pub struct Signer {
     /// The tx fee in uSTX to use if the epoch is pre Nakamoto (Epoch 3.0)
     pub tx_fee_ms: u64,
     /// Signer DB path
-    pub db_path: PathBuf,
+    pub db_path: Option<PathBuf>,
     /// SignerDB for state management
     pub signer_db: SignerDb,
 }
@@ -215,7 +212,7 @@ impl Signer {
             reward_cycle: reward_cycle_config.reward_cycle,
             tx_fee_ms: config.tx_fee_ms,
             db_path: config.db_path.clone(),
-            signer_db,
+            signer_db: signer_db,
         }
     }
 
@@ -259,10 +256,6 @@ impl Signer {
                 merkle_root,
             } => {
                 let signer_signature_hash = block.header.signer_signature_hash();
-                // let block_info = self
-                //     .blocks
-                //     .entry(signer_signature_hash)
-                //     .or_insert_with(|| BlockInfo::new(block.clone()));
                 let mut block_info = self
                     .signer_db
                     .block_lookup(&signer_signature_hash)
@@ -283,6 +276,11 @@ impl Signer {
                         debug!("Signer #{}: ACK: {ack:?}", self.signer_id);
                         self.state = State::OperationInProgress;
                         block_info.signed_over = true;
+                        self.signer_db
+                            .insert_block(&block_info)
+                            .unwrap_or_else(|e| {
+                                error!("Failed to insert block in DB: {e:?}");
+                            });
                     }
                     Err(e) => {
                         error!(
@@ -1407,6 +1405,7 @@ mod tests {
     use crate::client::{StacksClient, VOTE_FUNCTION_NAME};
     use crate::config::GlobalConfig;
     use crate::signer::{BlockInfo, Signer};
+    use crate::signerdb::SignerDb;
 
     #[test]
     #[serial]
@@ -1642,7 +1641,7 @@ mod tests {
 
         let signer_signature_hash = block.header.signer_signature_hash();
 
-        let signer_db = signer.signer_db.clone();
+        let signer_db = SignerDb::new(&signer.db_path).unwrap();
 
         let h = spawn(move || signer.verify_block_transactions(&stacks_client, &block));
 
@@ -1689,10 +1688,9 @@ mod tests {
         let valid = h.join().unwrap();
         assert!(valid);
 
-        let stored_block = signer_db
+        let stored_block = &signer_db
             .block_lookup(&signer_signature_hash)
             .expect("Failed to get block from db");
-        println!("{:?}", stored_block);
         assert!(stored_block.is_some());
     }
 

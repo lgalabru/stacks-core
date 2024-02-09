@@ -16,30 +16,26 @@
 
 use std::path::PathBuf;
 
-use blockstack_lib::util_lib::db::{query_row, table_exists, tx_begin_immediate, Error as DBError};
-use r2d2::PooledConnection;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, Error as SqliteError, ToSql, Transaction as SqlTransaction, NO_PARAMS};
+use blockstack_lib::util_lib::db::{
+    query_row, sqlite_open, table_exists, tx_begin_immediate, Error as DBError,
+};
+use rusqlite::{
+    Connection, Error as SqliteError, OpenFlags, ToSql, Transaction as SqlTransaction, NO_PARAMS,
+};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use crate::signer::BlockInfo;
 
 /// This struct manages a SQLite database connection
 /// for the signer.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SignerDb {
     /// The SQLite database path
-    pub db_path: PathBuf,
-    /// Connection pool. A pool is used to allow for
-    /// thread-safe connections
-    pub pool: r2d2::Pool<SqliteConnectionManager>,
+    pub db_path: Option<PathBuf>,
+    // /// Connection to the DB
+    // /// TODO: Figure out how to manage this connection
+    // connection: Option<Connection>,
 }
-
-const CREATE_TABLE: &'static str = "
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY,
-    topic TEXT NOT NULL
-)";
 
 const CREATE_BLOCKS_TABLE: &'static str = "
 CREATE TABLE IF NOT EXISTS blocks (
@@ -51,28 +47,22 @@ impl SignerDb {
     /// Create a new `SignerState` instance.
     /// This will create a new SQLite database at the given path
     /// if one doesn't exist.
-    pub fn new(db_path: &PathBuf) -> Result<SignerDb, DBError> {
-        if db_path == &PathBuf::from(":memory:") {
-            return Ok(SignerDb::memory_db());
-        }
-        let manager = SqliteConnectionManager::file(db_path).with_init(
-            |db: &mut Connection| -> Result<(), rusqlite::Error> {
-                db.pragma_update(None, "journal_mode", &"WAL".to_sql().unwrap())?;
-                db.pragma_update(None, "synchronous", &"NORMAL".to_sql().unwrap())?;
-                // If using foreign keys:
-                // sql_pragma(&db, "foreign_keys", &true).map_err(DBError::from);
+    pub fn new(db_path: &Option<PathBuf>) -> Result<SignerDb, DBError> {
+        let signer_db = SignerDb {
+            db_path: db_path.clone(),
+        };
+        let mut connection = signer_db.get_connection()?;
+        connection.pragma_update(None, "journal_mode", &"WAL".to_sql().unwrap())?;
+        connection.pragma_update(None, "synchronous", &"NORMAL".to_sql().unwrap())?;
+        let tx = tx_begin_immediate(&mut connection).expect("Unable to begin tx");
+        Self::instantiate_db(&tx).expect("Could not instantiate SignerDB");
+        tx.commit().expect("Unable to commit tx");
 
-                let tx = tx_begin_immediate(db).expect("Unable to begin tx");
-                Self::instantiate_db(&tx).expect("Could not instantiate SignerDB");
-                tx.commit().expect("Unable to commit tx");
-
-                Ok(())
-            },
-        );
-        let pool = r2d2::Pool::new(manager).expect("Could not create connection pool");
+        let tx = tx_begin_immediate(&mut connection).expect("Unable to begin tx");
+        Self::instantiate_db(&tx).expect("Could not instantiate SignerDB");
+        tx.commit().expect("Unable to commit tx");
         Ok(SignerDb {
             db_path: db_path.clone(),
-            pool,
         })
     }
 
@@ -81,9 +71,6 @@ impl SignerDb {
     }
 
     fn instantiate_db(db: &SqlTransaction) -> Result<(), SqliteError> {
-        if !Self::db_already_instantiated(db, "events")? {
-            db.execute(CREATE_TABLE, NO_PARAMS)?;
-        }
         if !Self::db_already_instantiated(db, "blocks")? {
             db.execute(CREATE_BLOCKS_TABLE, NO_PARAMS)?;
         }
@@ -91,18 +78,22 @@ impl SignerDb {
         Ok(())
     }
 
-    fn get_connection(&self) -> Result<PooledConnection<SqliteConnectionManager>, DBError> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|_e| DBError::Other("Unable to get pooled connection".to_string()));
-        conn
+    fn get_connection(&self) -> Result<Connection, DBError> {
+        let db_path = self.db_path.clone().unwrap_or(PathBuf::from(":memory:"));
+        if &db_path == &PathBuf::from(":memory:") {
+            return Ok(self.memory_conn());
+        }
+        sqlite_open(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            false,
+        )
+        .map_err(|e| DBError::from(e))
     }
 
     /// Fetch a block from the database using the block's
     /// `signer_signature_hash`
     pub fn block_lookup(&self, hash: &Sha512Trunc256Sum) -> Result<Option<BlockInfo>, DBError> {
-        // let conn = Connection::open(&self.db_path)?;
         let conn = self.get_connection()?;
         let result: Option<String> = query_row(
             &conn,
@@ -120,12 +111,13 @@ impl SignerDb {
 
     /// Insert a block into the database.
     /// `hash` is the `signer_signature_hash` of the block.
-    pub fn insert_block(&self, block_info: &BlockInfo) -> Result<(), DBError> {
-        let conn = self.get_connection()?;
+    pub fn insert_block(&mut self, block_info: &BlockInfo) -> Result<(), DBError> {
+        let mut conn = self.get_connection()?;
         let block_json =
             serde_json::to_string(&block_info).expect("Unable to serialize block info");
         let hash = &block_info.signer_signature_hash();
-        conn.execute(
+        let tx = tx_begin_immediate(&mut conn).expect("Unable to begin tx");
+        tx.execute(
             "INSERT OR REPLACE INTO blocks (signer_signature_hash, block_info) VALUES (?1, ?2)",
             &[format!("{}", hash), block_json],
         )
@@ -135,35 +127,34 @@ impl SignerDb {
                 e.to_string()
             ));
         })?;
+        tx.commit().expect("Unable to commit tx");
         Ok(())
     }
 
     /// Remove a block
-    pub fn remove_block(&self, hash: &Sha512Trunc256Sum) -> Result<(), DBError> {
-        let conn = self.get_connection()?;
-        conn.execute(
+    pub fn remove_block(&mut self, hash: &Sha512Trunc256Sum) -> Result<(), DBError> {
+        let mut conn = self.get_connection()?;
+        let tx = tx_begin_immediate(&mut conn).expect("Unable to begin tx");
+        tx.execute(
             "DELETE FROM blocks WHERE signer_signature_hash = ?",
             &[format!("{}", hash)],
         )
-        // .map_err(|e| rusqlite::Error::from(e))?;
         .map_err(|e| DBError::from(e))?;
+        tx.commit().map_err(|e| DBError::from(e))?;
         Ok(())
     }
 
     /// Generate a new memory-backed DB
     pub fn memory_db() -> SignerDb {
-        let pool = r2d2::Pool::builder()
-            .max_size(1)
-            .build(SqliteConnectionManager::memory())
-            .expect("Could not create connection pool");
-        let mut db = pool.get().unwrap();
-        let tx = tx_begin_immediate(&mut db).unwrap();
-        Self::instantiate_db(&tx).expect("Could not instantiate SignerDB");
-        tx.commit().expect("Could not commit SignerDB transaction");
         SignerDb {
-            db_path: PathBuf::from(":memory:"),
-            pool,
+            db_path: Some(PathBuf::from(":memory:")),
         }
+    }
+
+    /// Generate a new memory-backed DB connection
+    pub fn memory_conn(&self) -> Connection {
+        let db = Connection::open_in_memory().expect("Could not create in-memory db");
+        db
     }
 }
 
@@ -174,7 +165,7 @@ pub fn test_signer_db(db_path: &str) -> SignerDb {
     if fs::metadata(&db_path).is_ok() {
         fs::remove_file(&db_path).unwrap();
     }
-    SignerDb::new(&db_path.into()).expect("Failed to create signer db")
+    SignerDb::new(&Some(db_path.into())).expect("Failed to create signer db")
 }
 
 #[cfg(test)]
@@ -188,8 +179,6 @@ mod tests {
         types::chainstate::{ConsensusHash, StacksBlockId, TrieHash},
         util::secp256k1::MessageSignature,
     };
-
-    // use crate::runloop::BlockInfo;
 
     use super::*;
     use std::fs;
@@ -227,31 +216,14 @@ mod tests {
         create_block_override(|_| {})
     }
 
-    fn _with_db<F>(db_path_str: &str, f: F)
-    where
-        F: Fn(SignerDb),
-    {
-        let db_path: PathBuf = db_path_str.into();
-        let wal_path = format!("{}-wal", db_path_str);
-        let shm_path = format!("{}-shm", db_path_str);
-        _wipe_db(&db_path);
-        _wipe_db(&wal_path.clone().into());
-        _wipe_db(&shm_path.clone().into());
-        let db = SignerDb::new(&db_path).expect("Failed to create signer db");
-        f(db);
-        _wipe_db(&db_path);
-        _wipe_db(&wal_path.into());
-        _wipe_db(&shm_path.into());
-    }
-
-    fn tmp_db_path() -> PathBuf {
-        format!("/tmp/stacks-signer-test-{}.sqlite", rand::random::<u64>()).into()
+    fn tmp_db_path() -> Option<PathBuf> {
+        Some(format!("/tmp/stacks-signer-test-{}.sqlite", rand::random::<u64>()).into())
     }
 
     #[test]
     fn test_basic_signer_db() {
         let db_path = tmp_db_path();
-        let db = SignerDb::new(&db_path).expect("Failed to create signer db");
+        let mut db = SignerDb::new(&db_path).expect("Failed to create signer db");
         let (block_info, block) = create_block();
         db.insert_block(&block_info)
             .expect("Unable to insert block into db");
@@ -267,7 +239,7 @@ mod tests {
     #[test]
     fn test_update_block() {
         let db_path = tmp_db_path();
-        let db = SignerDb::new(&db_path).expect("Failed to create signer db");
+        let mut db = SignerDb::new(&db_path).expect("Failed to create signer db");
         let (block_info, block) = create_block();
         db.insert_block(&block_info)
             .expect("Unable to insert block into db");

@@ -170,7 +170,7 @@ pub struct GlobalConfig {
     /// the STX tx fee to use in uSTX
     pub tx_fee_ms: u64,
     /// The path to the signer's database file
-    pub db_path: PathBuf,
+    pub db_path: Option<PathBuf>,
 }
 
 /// Internal struct for loading up the config file
@@ -200,7 +200,7 @@ struct RawConfigFile {
     /// the STX tx fee to use in uSTX
     pub tx_fee_ms: Option<u64>,
     /// The path to the signer's database file
-    pub db_path: String,
+    pub db_path: Option<String>,
 }
 
 impl RawConfigFile {
@@ -287,7 +287,11 @@ impl TryFrom<RawConfigFile> for GlobalConfig {
         let dkg_private_timeout = raw_data.dkg_private_timeout_ms.map(Duration::from_millis);
         let nonce_timeout = raw_data.nonce_timeout_ms.map(Duration::from_millis);
         let sign_timeout = raw_data.sign_timeout_ms.map(Duration::from_millis);
-        let db_path = raw_data.db_path.into();
+        let db_path = if let Some(db_path) = raw_data.db_path {
+            Some(PathBuf::from(db_path))
+        } else {
+            None
+        };
         Ok(Self {
             node_host,
             endpoint,
