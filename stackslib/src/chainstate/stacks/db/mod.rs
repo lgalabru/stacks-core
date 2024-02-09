@@ -220,6 +220,8 @@ pub struct StacksEpochReceipt {
     /// in.
     pub evaluated_epoch: StacksEpochId,
     pub epoch_transition: bool,
+    /// Was .signers updated during this block?
+    pub signers_updated: bool,
 }
 
 /// Headers we serve over the network
@@ -532,8 +534,11 @@ impl<'a, 'b> ClarityTx<'a, 'b> {
         self.block.commit_block();
     }
 
-    pub fn commit_mined_block(self, block_hash: &StacksBlockId) -> ExecutionCost {
-        self.block.commit_mined_block(block_hash).get_total()
+    pub fn commit_mined_block(
+        self,
+        block_hash: &StacksBlockId,
+    ) -> Result<ExecutionCost, clarity_error> {
+        Ok(self.block.commit_mined_block(block_hash)?.get_total())
     }
 
     pub fn commit_to_block(
@@ -2378,7 +2383,9 @@ impl StacksChainState {
         let height_opt = clarity_tx
             .connection()
             .with_clarity_db_readonly::<_, Result<_, ()>>(|ref mut db| {
-                let height_opt = db.get_microblock_pubkey_hash_height(mblock_pubkey_hash);
+                let height_opt = db
+                    .get_microblock_pubkey_hash_height(mblock_pubkey_hash)
+                    .expect("FATAL: failed to query microblock public key hash");
                 Ok(height_opt)
             })
             .expect("FATAL: failed to query microblock public key hash");

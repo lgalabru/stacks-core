@@ -58,7 +58,8 @@ use crate::net::db::{LocalPeer, PeerDB};
 use crate::net::download::BlockDownloader;
 use crate::net::http::HttpRequestContents;
 use crate::net::httpcore::StacksHttpRequest;
-use crate::net::inv::*;
+use crate::net::inv::inv2x::*;
+use crate::net::inv::nakamoto::InvGenerator;
 use crate::net::neighbors::*;
 use crate::net::poll::{NetworkPollState, NetworkState};
 use crate::net::prune::*;
@@ -217,6 +218,7 @@ pub struct PeerNetwork {
     // refreshed whenever the burnchain advances
     pub chain_view: BurnchainView,
     pub burnchain_tip: BlockSnapshot,
+    pub stacks_tip: (ConsensusHash, BlockHeaderHash, u64),
     pub chain_view_stable_consensus_hash: ConsensusHash,
     pub ast_rules: ASTRules,
 
@@ -350,6 +352,10 @@ pub struct PeerNetwork {
     // fault injection -- force disconnects
     fault_last_disconnect: u64,
 
+    /// Nakamoto-specific cache for sortition and tenure data, for the purposes of generating
+    /// tenure inventories
+    pub nakamoto_inv_generator: InvGenerator,
+
     /// Thread handle for the async block proposal endpoint.
     block_proposal_thread: Option<JoinHandle<()>>,
 }
@@ -416,6 +422,7 @@ impl PeerNetwork {
                 &first_burn_header_hash,
                 first_burn_header_ts as u64,
             ),
+            stacks_tip: (ConsensusHash([0x00; 20]), BlockHeaderHash([0x00; 32]), 0),
 
             peerdb: peerdb,
             atlasdb: atlasdb,
@@ -498,6 +505,8 @@ impl PeerNetwork {
             pending_messages: HashMap::new(),
 
             fault_last_disconnect: 0,
+
+            nakamoto_inv_generator: InvGenerator::new(),
 
             block_proposal_thread: None,
         };
@@ -1016,9 +1025,9 @@ impl PeerNetwork {
         let num_allowed_peers = allowed_peers.len();
         let mut count = 0;
         for allowed in allowed_peers {
-            if self.events.contains_key(&allowed.addr) {
-                count += 1;
-            }
+            let pubkh = Hash160::from_node_public_key(&allowed.public_key);
+            let events = self.get_pubkey_events(&pubkh);
+            count += events.len() as u64;
         }
         Ok((count, num_allowed_peers as u64))
     }
@@ -1534,6 +1543,15 @@ impl PeerNetwork {
                 event_id
             );
             return Err(net_error::AlreadyConnected(event_id, neighbor_key.clone()));
+        }
+
+        // unroutable?
+        if !self.connection_opts.private_neighbors && neighbor_key.addrbytes.is_in_private_range() {
+            debug!("{:?}: Peer {:?} is in private range and we are configured to drop private neighbors",
+                  &self.local_peer,
+                  &neighbor_key
+            );
+            return Err(net_error::Denied);
         }
 
         // consider rate-limits on in-bound peers
@@ -5196,6 +5214,21 @@ impl PeerNetwork {
         &self.stacker_db_configs
     }
 
+    /// Reload StackerDB configs from chainstate
+    pub fn refresh_stacker_db_configs(
+        &mut self,
+        sortdb: &SortitionDB,
+        chainstate: &mut StacksChainState,
+    ) -> Result<(), net_error> {
+        let stacker_db_configs = mem::replace(&mut self.stacker_db_configs, HashMap::new());
+        self.stacker_db_configs = self.stackerdbs.create_or_reconfigure_stackerdbs(
+            chainstate,
+            sortdb,
+            stacker_db_configs,
+        )?;
+        Ok(())
+    }
+
     /// Refresh view of burnchain, if needed.
     /// If the burnchain view changes, then take the following additional steps:
     /// * hint to the inventory sync state-machine to restart, since we potentially have a new
@@ -5211,9 +5244,16 @@ impl PeerNetwork {
         ibd: bool,
     ) -> Result<HashMap<NeighborKey, Vec<StacksMessage>>, net_error> {
         // update burnchain snapshot if we need to (careful -- it's expensive)
-        let sn = SortitionDB::get_canonical_burn_chain_tip(&sortdb.conn())?;
+        let sn = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn())?;
+        let stacks_tip =
+            SortitionDB::get_canonical_stacks_chain_tip_hash_and_height(sortdb.conn())?;
+
+        let burnchain_tip_changed = sn.block_height != self.chain_view.burn_block_height;
+        let stacks_tip_changed = self.stacks_tip != stacks_tip;
         let mut ret: HashMap<NeighborKey, Vec<StacksMessage>> = HashMap::new();
-        if sn.block_height != self.chain_view.burn_block_height {
+
+        if burnchain_tip_changed || stacks_tip_changed {
+            // only do the needful depending on what changed
             debug!(
                 "{:?}: load chain view for burn block {}",
                 &self.local_peer, sn.block_height
@@ -5232,6 +5272,12 @@ impl PeerNetwork {
                 ancestor_sn.consensus_hash
             };
 
+            // update cached burnchain view for /v2/info
+            self.chain_view = new_chain_view;
+            self.chain_view_stable_consensus_hash = new_chain_view_stable_consensus_hash;
+        }
+
+        if burnchain_tip_changed {
             // wake up the inv-sync and downloader -- we have potentially more sortitions
             self.hint_sync_invs(self.chain_view.burn_stable_block_height);
             self.hint_download_rescan(
@@ -5246,10 +5292,6 @@ impl PeerNetwork {
             self.antientropy_last_push_ts = get_epoch_time_secs();
             self.antientropy_start_reward_cycle =
                 self.pox_id.num_inventory_reward_cycles().saturating_sub(1) as u64;
-
-            // update cached burnchain view for /v2/info
-            self.chain_view = new_chain_view;
-            self.chain_view_stable_consensus_hash = new_chain_view_stable_consensus_hash;
 
             // update tx validation information
             self.ast_rules = SortitionDB::get_ast_rules(sortdb.conn(), sn.block_height)?;
@@ -5293,18 +5335,10 @@ impl PeerNetwork {
                 .unwrap_or(Txid([0x00; 32]));
 
             // refresh stackerdb configs
-            let stacker_db_configs = mem::replace(&mut self.stacker_db_configs, HashMap::new());
-            self.stacker_db_configs = self.stackerdbs.create_or_reconfigure_stackerdbs(
-                chainstate,
-                sortdb,
-                stacker_db_configs,
-            )?;
+            self.refresh_stacker_db_configs(sortdb, chainstate)?;
         }
 
-        if sn.canonical_stacks_tip_hash != self.burnchain_tip.canonical_stacks_tip_hash
-            || sn.canonical_stacks_tip_consensus_hash
-                != self.burnchain_tip.canonical_stacks_tip_consensus_hash
-        {
+        if stacks_tip_changed {
             // update stacks tip affirmation map view
             let burnchain_db = self.burnchain.open_burnchain_db(false)?;
             self.stacks_tip_affirmation_map = static_get_stacks_tip_affirmation_map(
@@ -5321,7 +5355,7 @@ impl PeerNetwork {
 
         // can't fail after this point
 
-        if sn.burn_header_hash != self.burnchain_tip.burn_header_hash {
+        if burnchain_tip_changed {
             // try processing previously-buffered messages (best-effort)
             let buffered_messages = mem::replace(&mut self.pending_messages, HashMap::new());
             ret =
@@ -5330,6 +5364,7 @@ impl PeerNetwork {
 
         // update cached stacks chain view for /v2/info
         self.burnchain_tip = sn;
+        self.stacks_tip = stacks_tip;
         Ok(ret)
     }
 
