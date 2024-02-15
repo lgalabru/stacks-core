@@ -385,6 +385,7 @@ impl<'a> ClarityBackingStore for ReadOnlyMarfStore<'a> {
             .expect("Attempted to get the open chain tip from an unopened context.")
     }
 
+    // TODO: [Clarity] This serializes the marf value to hex and then looks up the value in the side store.
     fn get_with_proof(&mut self, key: &str) -> InterpreterResult<Option<(String, Vec<u8>)>> {
         self.marf
             .get_with_proof(&self.chain_tip, key)
@@ -396,7 +397,7 @@ impl<'a> ClarityBackingStore for ReadOnlyMarfStore<'a> {
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
-                    SqliteConnection::get(self.get_side_store(), &side_key)?.ok_or_else(|| {
+                    SqliteConnection::get_data(self.get_side_store(), &side_key)?.ok_or_else(|| {
                         InterpreterError::Expect(format!(
                             "ERROR: MARF contained value_hash not found in side storage: {}",
                             side_key
@@ -426,7 +427,7 @@ impl<'a> ClarityBackingStore for ReadOnlyMarfStore<'a> {
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 trace!("MarfedKV get side-key for {:?}: {:?}", key, &side_key);
-                SqliteConnection::get(self.get_side_store(), &side_key)?.ok_or_else(|| {
+                SqliteConnection::get_data(self.get_side_store(), &side_key)?.ok_or_else(|| {
                     InterpreterError::Expect(format!(
                         "ERROR: MARF contained value_hash not found in side storage: {}",
                         side_key
@@ -437,7 +438,7 @@ impl<'a> ClarityBackingStore for ReadOnlyMarfStore<'a> {
             .transpose()
     }
 
-    fn put_all(&mut self, _items: Vec<(String, String)>) -> InterpreterResult<()> {
+    fn put_all_data(&mut self, _items: Vec<(String, String)>) -> InterpreterResult<()> {
         error!("Attempted to commit changes to read-only MARF");
         panic!("BUG: attempted commit to read-only MARF");
     }
@@ -572,7 +573,7 @@ impl<'a> ClarityBackingStore for WritableMarfStore<'a> {
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 trace!("MarfedKV get side-key for {:?}: {:?}", key, &side_key);
-                SqliteConnection::get(self.marf.sqlite_tx(), &side_key)?.ok_or_else(|| {
+                SqliteConnection::get_data(self.marf.sqlite_tx(), &side_key)?.ok_or_else(|| {
                     InterpreterError::Expect(format!(
                         "ERROR: MARF contained value_hash not found in side storage: {}",
                         side_key
@@ -594,7 +595,7 @@ impl<'a> ClarityBackingStore for WritableMarfStore<'a> {
             .map(|(marf_value, proof)| {
                 let side_key = marf_value.to_hex();
                 let data =
-                    SqliteConnection::get(self.marf.sqlite_tx(), &side_key)?.ok_or_else(|| {
+                    SqliteConnection::get_data(self.marf.sqlite_tx(), &side_key)?.ok_or_else(|| {
                         InterpreterError::Expect(format!(
                             "ERROR: MARF contained value_hash not found in side storage: {}",
                             side_key
@@ -666,13 +667,13 @@ impl<'a> ClarityBackingStore for WritableMarfStore<'a> {
         }
     }
 
-    fn put_all(&mut self, items: Vec<(String, String)>) -> InterpreterResult<()> {
+    fn put_all_data(&mut self, items: Vec<(String, String)>) -> InterpreterResult<()> {
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for (key, value) in items.into_iter() {
             trace!("MarfedKV put '{}' = '{}'", &key, &value);
             let marf_value = MARFValue::from_value(&value);
-            SqliteConnection::put(self.get_side_store(), &marf_value.to_hex(), &value)?;
+            SqliteConnection::put_data(self.get_side_store(), &marf_value.to_hex(), &value)?;
             keys.push(key);
             values.push(marf_value);
         }
