@@ -20,7 +20,7 @@ use std::fmt;
 use std::mem::replace;
 
 #[cfg(test)]
-use fake::Dummy;
+use fake::{Faker, Dummy};
 
 use serde::Serialize;
 use serde_json::json;
