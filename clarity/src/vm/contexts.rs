@@ -20,8 +20,7 @@ use std::fmt;
 use std::mem::replace;
 
 #[cfg(test)]
-use fake::{Faker, Dummy};
-
+use fake::{Dummy, Faker};
 use serde::Serialize;
 use serde_json::json;
 use stacks_common::consts::CHAIN_ID_TESTNET;
@@ -1001,7 +1000,7 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
         let contract = self
             .global_context
             .database
-        //    .get_contract(contract_identifier)?;
+            //    .get_contract(contract_identifier)?;
             .get_contract2(contract_identifier)?;
 
         let result = {
