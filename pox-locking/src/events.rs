@@ -115,6 +115,9 @@ fn create_event_info_data_code(
         "stack-stx" => {
             format!(
                 r#"
+                (let (
+                    (unlock-burn-height (reward-cycle-to-burn-height (+ (current-pox-reward-cycle) u1 {lock_period})))
+                )
                 {{
                     data: {{
                         ;; amount of ustx to lock.
@@ -122,7 +125,7 @@ fn create_event_info_data_code(
                         lock-amount: {lock_amount},
                         ;; burnchain height when the unlock finishes.
                         ;; derived from args[3]
-                        unlock-burn-height: (reward-cycle-to-burn-height (+ (current-pox-reward-cycle) u1 {lock_period})),
+                        unlock-burn-height: unlock-burn-height,
                         ;; PoX address tuple.
                         ;; equal to args[1].
                         pox-addr: {pox_addr},
@@ -136,8 +139,10 @@ fn create_event_info_data_code(
                         signer-sig: {signer_sig},
                         ;; equal to args[5]
                         signer-key: {signer_key},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle unlock-burn-height),
                     }}
-                }}
+                }})
                 "#,
                 lock_amount = &args[0],
                 lock_period = &args[3],
@@ -150,6 +155,9 @@ fn create_event_info_data_code(
         "delegate-stack-stx" => {
             format!(
                 r#"
+                (let (
+                    (unlock-burn-height (reward-cycle-to-burn-height (+ (current-pox-reward-cycle) u1 {lock_period})))
+                )
                 {{
                     data: {{
                         ;; amount of ustx to lock.
@@ -157,7 +165,7 @@ fn create_event_info_data_code(
                         lock-amount: {lock_amount},
                         ;; burnchain height when the unlock finishes.
                         ;; derived from args[4]
-                        unlock-burn-height: (reward-cycle-to-burn-height (+ (current-pox-reward-cycle) u1 {lock_period})),
+                        unlock-burn-height: unlock-burn-height,
                         ;; PoX address tuple.
                         ;; equal to args[2]
                         pox-addr: {pox_addr},
@@ -172,8 +180,10 @@ fn create_event_info_data_code(
                         ;; stacker
                         ;; equal to args[0]
                         stacker: '{stacker},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle unlock-burn-height),
                     }}
-                }}
+                }})
                 "#,
                 stacker = &args[0],
                 lock_amount = &args[1],
@@ -195,7 +205,9 @@ fn create_event_info_data_code(
                         ;; derived from args[0]
                         total-locked: (+ {increase_by} (get locked (stx-account tx-sender))),
                         ;; pox addr increased
-                        pox-addr: (get pox-addr (unwrap-panic (map-get? stacking-state {{ stacker: tx-sender }})))
+                        pox-addr: (get pox-addr (unwrap-panic (map-get? stacking-state {{ stacker: tx-sender }}))),
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle (get unlock-height (stx-account tx-sender))),
                     }}
                 }}
                 "#,
@@ -221,7 +233,9 @@ fn create_event_info_data_code(
                         delegator: tx-sender,
                         ;; stacker
                         ;; equal to args[0]
-                        stacker: '{stacker}
+                        stacker: '{stacker},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle (get unlock-height (stx-account '{stacker}))),
                     }}
                 }}
                 "#,
@@ -259,6 +273,8 @@ fn create_event_info_data_code(
                         signer-sig: {signer_sig},
                         ;; equal to args[3]
                         signer-key: {signer_key},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle new-unlock-ht),
                     }}
                 }})
                 "#,
@@ -296,7 +312,9 @@ fn create_event_info_data_code(
                         delegator: tx-sender,
                         ;; stacker
                         ;; equal to args[0]
-                        stacker: '{stacker}
+                        stacker: '{stacker},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle new-unlock-ht),
                     }}
                 }})
                 "#,
@@ -326,6 +344,8 @@ fn create_event_info_data_code(
                         signer-sig: {signer_sig},
                         ;; equal to args[3]
                         signer-key: {signer_key},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle (get unlock-height (stx-account tx-sender))),
                     }}
                 }}
                 "#,
@@ -353,7 +373,9 @@ fn create_event_info_data_code(
                         ;; delegator (this is the caller)
                         delegator: tx-sender,
                         ;; equal to args[2]
-                        reward-cycle-index: {reward_cycle_index}
+                        reward-cycle-index: {reward_cycle_index},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle (get unlock-height (stx-account tx-sender))),
                     }}
                 }}
                 "#,
@@ -378,7 +400,9 @@ fn create_event_info_data_code(
                         unlock-burn-height: {until_burn_height},
                         ;; optional PoX address tuple.
                         ;; equal to args[3].
-                        pox-addr: {pox_addr}
+                        pox-addr: {pox_addr},
+                        ;; Get end cycle ID
+                        end-cycle-id: (burn-height-to-reward-cycle {until_burn_height}),
                     }}
                 }}
                 "#,
