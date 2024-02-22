@@ -112,10 +112,11 @@ fn create_event_info_data_code(
     response: &ResponseData,
 ) -> String {
     // If a given burn block height is in a prepare phase, then the stacker will be in the _next_ reward cycle, so bump the cycle by 1
-    let prepare_phase_cycle_offset = r#"
-        (prepare-phase-offset (if (< (mod (+ (- %height% (var-get first-burnchain-block-height)) (var-get pox-prepare-cycle-length))
-            (var-get pox-reward-cycle-length))
-            (var-get pox-prepare-cycle-length))) u0 u1))
+    let prepare_offset = r#"
+        (prepare-offset (if (<
+            (mod (- %height% (var-get first-burnchain-block-height)) (var-get pox-reward-cycle-length))
+            (- (var-get pox-reward-cycle-length) (var-get pox-prepare-cycle-length))
+        ) u0 u1))
     "#;
 
     match function_name {
@@ -124,7 +125,7 @@ fn create_event_info_data_code(
                 r#"
                 (let (
                     (unlock-burn-height (reward-cycle-to-burn-height (+ (current-pox-reward-cycle) u1 {lock_period})))
-                    {prepare_phase_cycle_offset}
+                    {prepare_offset}
                 )
                 {{
                     data: {{
@@ -150,7 +151,7 @@ fn create_event_info_data_code(
                         ;; Get end cycle ID
                         end-cycle-id: (burn-height-to-reward-cycle unlock-burn-height),
                         ;; Get start cycle ID
-                        start-cycle-id: (+ current-pox-reward-cycle prepare-phase-offset),
+                        start-cycle-id: (+ current-pox-reward-cycle prepare-offset),
                     }}
                 }})
                 "#,
@@ -160,8 +161,7 @@ fn create_event_info_data_code(
                 start_burn_height = &args[2],
                 signer_sig = &args.get(4).unwrap_or(&Value::none()),
                 signer_key = &args.get(5).unwrap_or(&Value::none()),
-                prepare_phase_cycle_offset =
-                    prepare_phase_cycle_offset.replace("%height%", "burn-block-height"),
+                prepare_offset = prepare_offset.replace("%height%", "burn-block-height"),
             )
         }
         "delegate-stack-stx" => {
@@ -194,6 +194,8 @@ fn create_event_info_data_code(
                         stacker: '{stacker},
                         ;; Get end cycle ID
                         end-cycle-id: (burn-height-to-reward-cycle unlock-burn-height),
+                        ;; Get start cycle ID
+                        start-cycle-id: (+ current-pox-reward-cycle prepare-offset),
                     }}
                 }})
                 "#,
@@ -202,11 +204,16 @@ fn create_event_info_data_code(
                 pox_addr = &args[2],
                 start_burn_height = &args[3],
                 lock_period = &args[4],
+                prepare_offset = prepare_offset.replace("%height%", "burn-block-height"),
             )
         }
         "stack-increase" => {
             format!(
                 r#"
+                (let (
+                    (unlock-height (get unlock-height (stx-account tx-sender)))
+                    {prepare_offset}
+                )
                 {{
                     data: {{
                         ;; amount to increase by
@@ -219,11 +226,14 @@ fn create_event_info_data_code(
                         ;; pox addr increased
                         pox-addr: (get pox-addr (unwrap-panic (map-get? stacking-state {{ stacker: tx-sender }}))),
                         ;; Get end cycle ID
-                        end-cycle-id: (burn-height-to-reward-cycle (get unlock-height (stx-account tx-sender))),
+                        end-cycle-id: (burn-height-to-reward-cycle unlock-height),
+                        ;; Get start cycle ID
+                        start-cycle-id: (+ (burn-height-to-reward-cycle unlock-height) prepare-offset),
                     }}
-                }}
+                }})
                 "#,
-                increase_by = &args[0]
+                increase_by = &args[0],
+                prepare_offset = prepare_offset.replace("%height%", "unlock-height"),
             )
         }
         "delegate-stack-increase" => {
@@ -270,6 +280,7 @@ fn create_event_info_data_code(
                             unlock-in-cycle))
                     (last-extend-cycle  (- (+ first-extend-cycle {extend_count}) u1))
                     (new-unlock-ht (reward-cycle-to-burn-height (+ u1 last-extend-cycle)))
+                    {prepare_offset}
                 )
                 {{
                     data: {{
@@ -287,13 +298,16 @@ fn create_event_info_data_code(
                         signer-key: {signer_key},
                         ;; Get end cycle ID
                         end-cycle-id: (burn-height-to-reward-cycle new-unlock-ht),
+                        ;; Get start cycle ID
+                        start-cycle-id: (+ (burn-height-to-reward-cycle unlock-height) prepare-offset),
                     }}
                 }})
                 "#,
                 extend_count = &args[0],
                 pox_addr = &args[1],
                 signer_sig = &args.get(2).unwrap_or(&Value::none()),
-                signer_key = &args.get(3).map_or("none".to_string(), |v| v.to_string()),
+                signer_key = &args.get(3).map_or("none".to_string(), |v| v.to_string())
+                prepare_offset = prepare_offset.replace("%height%", "unlock-height"),
             )
         }
         "delegate-stack-extend" => {
@@ -338,6 +352,9 @@ fn create_event_info_data_code(
         "stack-aggregation-commit" | "stack-aggregation-commit-indexed" => {
             format!(
                 r#"
+                (let (
+                    {prepare_offset}
+                )
                 {{
                     data: {{
                         ;; pox addr locked up
@@ -358,18 +375,25 @@ fn create_event_info_data_code(
                         signer-key: {signer_key},
                         ;; Get end cycle ID
                         end-cycle-id: (burn-height-to-reward-cycle (get unlock-height (stx-account tx-sender))),
+                        ;; Get start cycle ID
+                        start-cycle-id: (+ current-pox-reward-cycle prepare-offset),
                     }}
-                }}
+                }})
                 "#,
                 pox_addr = &args[0],
                 reward_cycle = &args[1],
                 signer_sig = &args.get(2).unwrap_or(&Value::none()),
                 signer_key = &args.get(3).unwrap_or(&Value::none()),
+                prepare_offset = prepare_offset.replace("%height%", "burn-block-height"),
             )
         }
         "stack-aggregation-increase" => {
             format!(
                 r#"
+                (let (
+                    (unlock-height (get unlock-height (stx-account tx-sender)))
+                    {prepare_offset}
+                )
                 {{
                     data: {{
                         ;; pox addr locked up
@@ -387,13 +411,16 @@ fn create_event_info_data_code(
                         ;; equal to args[2]
                         reward-cycle-index: {reward_cycle_index},
                         ;; Get end cycle ID
-                        end-cycle-id: (burn-height-to-reward-cycle (get unlock-height (stx-account tx-sender))),
+                        end-cycle-id: (burn-height-to-reward-cycle unlock-height),
+                        ;; Get start cycle ID
+                        start-cycle-id: (+ (burn-height-to-reward-cycle unlock-height) prepare-offset),
                     }}
-                }}
+                }})
                 "#,
                 pox_addr = &args[0],
                 reward_cycle = &args[1],
                 reward_cycle_index = &args.get(2).unwrap_or(&Value::none()),
+                prepare_offset = prepare_offset.replace("%height%", "unlock-height"),
             )
         }
         "delegate-stx" => {
