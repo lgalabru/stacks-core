@@ -169,6 +169,7 @@ fn create_event_info_data_code(
                 r#"
                 (let (
                     (unlock-burn-height (reward-cycle-to-burn-height (+ (current-pox-reward-cycle) u1 {lock_period})))
+                    {prepare_offset}
                 )
                 {{
                     data: {{
