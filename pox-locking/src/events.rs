@@ -307,7 +307,7 @@ fn create_event_info_data_code(
                 extend_count = &args[0],
                 pox_addr = &args[1],
                 signer_sig = &args.get(2).unwrap_or(&Value::none()),
-                signer_key = &args.get(3).map_or("none".to_string(), |v| v.to_string())
+                signer_key = &args.get(3).map_or("none".to_string(), |v| v.to_string()),
                 prepare_offset = prepare_offset.replace("%height%", "unlock-height"),
             )
         }
