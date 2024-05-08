@@ -56,6 +56,7 @@ mod getattachment;
 mod getattachmentsinv;
 mod getblock;
 mod getblock_v3;
+mod getclaritymarfvalue;
 mod getconstantval;
 mod getcontractabi;
 mod getcontractsrc;
